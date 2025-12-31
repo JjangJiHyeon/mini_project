@@ -9,14 +9,98 @@ import pythoncom
 import json
 import os
 from ultralytics import YOLO
+from follow_up_service import FollowUpSpeechService
 
-# Vosk와 PyAudio는 선택 사항으로 처리 (설치 환경 문제 대비)
-VOSK_AVAILABLE = False
+# ==========================================
+# FollowUpManager: Handles scheduling and cancellation
+# ==========================================
+class FollowUpManager:
+    def __init__(self, pipeline):
+        self.pipeline = pipeline
+        self.service = FollowUpSpeechService()
+        self.pending_timer = None
+        self.lock = threading.Lock()
+        self.current_context = None # (label, distance)
+        
+        # LLM Suppression Logic
+        self.llm_call_history = {} # {entity_key: last_call_time}
+        self.ALLOWED_CLASSES = {'사람', '자동차', '자전거'} # person, car, bicycle
+        self.MAX_LLM_DIST = 4.0
+        self.COOL_DOWN_SEC = 8.0 # 5-8 seconds requirement
+
+    def cancel_pending(self):
+        with self.lock:
+            if self.pending_timer:
+                print("[FollowUpMgr] Cancelling pending follow-up.")
+                self.pending_timer.cancel()
+                self.pending_timer = None
+            self.current_context = None
+
+    def schedule_follow_up(self, label, distance, position_desc, entity_key):
+        """Schedules a follow-up with strict suppression gating."""
+        # Layer 1: Class and Distance Gating
+        if label not in self.ALLOWED_CLASSES:
+            # print(f"[FollowUpMgr] LLD Suppressed: {label} is not in whitelist.")
+            return
+
+        if distance > self.MAX_LLM_DIST:
+            # print(f"[FollowUpMgr] LLM Suppressed: distance {distance:.1f}m > {self.MAX_LLM_DIST}m.")
+            return
+
+        # Layer 2: Cool-down Gating
+        current_time = time.time()
+        last_call = self.llm_call_history.get(entity_key, 0)
+        if (current_time - last_call) < self.COOL_DOWN_SEC:
+            # print(f"[FollowUpMgr] LLM Suppressed: Cool-down active for {entity_key}.")
+            return
+
+        # Passed all gates - proceed to cancel pending and schedule new call
+        self.cancel_pending()
+        
+        with self.lock:
+            self.current_context = (label, distance)
+            # Record call time to enforce cool-down
+            self.llm_call_history[entity_key] = current_time
+            
+            # Reduced delay since immediate warning is removed
+            self.pending_timer = threading.Timer(0.2, self._execute_follow_up, args=(label, distance, position_desc))
+            self.pending_timer.start()
+            print(f"[FollowUpMgr] Gating Passed. Triggering LLM for {label} at {distance:.1f}m")
+
+    def _generate_rule_based_fallback(self, label, distance, position_desc):
+        """Deterministic safety fallback when LLM is unavailable."""
+        return f"{position_desc} {distance:.1f}미터에 {label}이 있으니 주의하세요."
+
+    def _execute_follow_up(self, label, distance, position_desc):
+        # Verification: Check if the situation is still relevant? 
+        # (For this MVP, we rely on the cancellation being called by the loop if object is gone)
+        
+        # This function runs in a separate thread (Timer thread)
+        # It calls the LLM, which is NOT in the detection loop.
+        explanation = self.service.generate_explanation(label, distance, position_desc)
+        
+        # Fallback if LLM fails (explanation is None)
+        if explanation is None:
+            print("[FollowUpMgr] LLM API failure. Triggering rule-based fallback.")
+            explanation = self._generate_rule_based_fallback(label, distance, position_desc)
+
+        if explanation:
+            print(f"[FollowUpMgr] Speech Output: {explanation}")
+            # Only play if not cancelled during LLM call
+            with self.lock:
+                if self.current_context == (label, distance):
+                    # Play the explanation through the pipeline's TTS worker
+                    self.pipeline.speak(explanation, is_follow_up=True)
+                else:
+                    print("[FollowUpMgr] Context changed during wait/call, discarding result.")
+
+# Whisper 및 PyAudio 설정
+WHISPER_AVAILABLE = False
 PYAUDIO_AVAILABLE = False
 try:
-    from vosk import Model, KaldiRecognizer
+    from faster_whisper import WhisperModel
     import pyaudio
-    VOSK_AVAILABLE = True
+    WHISPER_AVAILABLE = True
     PYAUDIO_AVAILABLE = True
 except ImportError:
     pass
@@ -46,18 +130,23 @@ class MVPTestPipeline:
         self.tts_thread.start()
 
         # STT (음성 인식) 초기화
-        self.model_path = "model-ko" # 한국어 모델 폴더명
         self.stt_thread = None
-        if VOSK_AVAILABLE and PYAUDIO_AVAILABLE and os.path.exists(self.model_path):
+        if WHISPER_AVAILABLE and PYAUDIO_AVAILABLE:
             try:
+                # Whisper 'base' 모델 로딩 (CPU 사용 시 최적화)
+                # 다국어 모델이므로 언어를 ko로 고정하면 더 정확함
+                print("Whisper 'base' 모델 로딩 중...")
+                self.whisper_model = WhisperModel("base", device="cpu", compute_type="int8")
                 self.stt_thread = threading.Thread(target=self._stt_worker, daemon=True)
                 self.stt_thread.start()
             except Exception as e:
                 print(f"⚠️ STT 초기화 중 오류 발생: {e}")
         else:
-            reason = "모델 폴더 없음" if not os.path.exists(self.model_path) else "라이브러리(vosk/pyaudio) 미설치"
-            print(f"⚠️ 음성 명령이 비활성화되었습니다. (원인: {reason})")
+            print(f"⚠️ 음성 명령이 비활성화되었습니다. (라이브러리 미설치)")
         
+        # FollowUp Manager 초기화
+        self.follow_up_mgr = FollowUpManager(self)
+
         # 시작 알림 (스피커 확인용)
         self.speak("시스템을 시작합니다.")
 
@@ -104,17 +193,21 @@ class MVPTestPipeline:
         self.roi_x_min = 0.3
         self.roi_x_max = 0.7
 
+        # Spatial Bucketing for entity differentiation
+        self.DIST_BIN_SIZE = 1.5   # meters
+        self.POS_BIN_SIZE = 0.1    # 10% of frame width
+
     def _tts_worker(self):
         """별도 스레드에서 SAPI 엔진을 초기화하고 안내를 처리 (가장 확실한 윈도우 방식)"""
         pythoncom.CoInitialize()
         speaker = win32com.client.Dispatch("SAPI.SpVoice")
         
         while True:
-            # 큐에서 데이터를 가져옴 (텍스트, 강제중지여부)
+            # 큐에서 데이터를 가져옴 (텍스트, 강제중지여부, follow_up여부)
             item = self.speech_queue.get()
             if item is None: break
             
-            text, force_stop = item
+            text, force_stop, is_follow_up = item
             
             # 뮤트 상태면 무시 (단, 강제 종료 안내는 예외)
             if self.is_muted and not force_stop:
@@ -128,33 +221,71 @@ class MVPTestPipeline:
             # SAPI Flag: 2 (SVSFPurgeBeforeSpeak)
             flags = 2 if force_stop else 0
             
-            print(f"[TTS 발화 시작] {text} (강제종료: {force_stop})")
+            print(f"[TTS 발화 시작] {text} (강제종료: {force_stop}, 후속: {is_follow_up})")
             try:
                 speaker.Speak(text, flags)
             except Exception as e:
                 print(f"[TTS 오류] {e}")
             print(f"[TTS 발화 완료] {text}")
+            
+            # 후속 안내가 아니고, 강제 중지가 아니면 Manager에게 완료 신호
+            # (실제로는 speak() 호출 시 Manager를 호출하게 변경할 수 있음)
             self.speech_queue.task_done()
 
     def _stt_worker(self):
-        """마이크 소리를 듣고 명령어를 인식하는 스레드"""
-        model = Model(self.model_path)
-        rec = KaldiRecognizer(model, 16000)
+        """마이크 소리를 듣고 Whisper로 인식하는 스레드 (VAD 포함)"""
+        CHUNK = 1024
+        FORMAT = pyaudio.paInt16
+        CHANNELS = 1
+        RATE = 16000
+        SILENCE_THRESHOLD = 500  # 음성 감지 임계값 (환경에 따라 조절 필요)
+        SILENCE_DURATION = 1.0   # 침묵 시간 (초)
+
         p = pyaudio.PyAudio()
-        stream = p.open(format=pyaudio.paInt16, channels=1, rate=16000, input=True, frames_per_buffer=8000)
+        stream = p.open(format=FORMAT, channels=CHANNELS, rate=RATE, input=True, frames_per_buffer=CHUNK)
         stream.start_stream()
 
-        print("🎙️ 음성 인식 준비 완료. 명령을 기다립니다...")
+        print("🎙️ Whisper STT 준비 완료. 명령을 기다립니다...")
+
+        audio_buffer = []
+        is_speaking = False
+        silence_start = None
 
         while True:
-            data = stream.read(4000, exception_on_overflow=False)
-            if rec.AcceptWaveform(data):
-                result = json.loads(rec.Result())
-                text = result.get("text", "").replace(" ", "")
-                if not text: continue
+            data = stream.read(CHUNK, exception_on_overflow=False)
+            audio_data = np.frombuffer(data, dtype=np.int16)
+            amplitude = np.abs(audio_data).mean()
 
-                print(f"👂 음성 인식 결과: {text}")
-                self.handle_command(text)
+            if amplitude > SILENCE_THRESHOLD:
+                if not is_speaking:
+                    is_speaking = True
+                    print("🗣️ 말하는 중...")
+                audio_buffer.append(audio_data)
+                silence_start = None
+            else:
+                if is_speaking:
+                    if silence_start is None:
+                        silence_start = time.time()
+                    
+                    audio_buffer.append(audio_data)
+
+                    # 일정 시간 이상 침묵 시 인식 시작
+                    if time.time() - silence_start > SILENCE_DURATION:
+                        print("⌛ 인식 중...")
+                        # 오디오 데이터를 Whisper 형식으로 변환 (float32, 16kHz)
+                        full_audio = np.concatenate(audio_buffer).astype(np.float32) / 32768.0
+                        
+                        segments, info = self.whisper_model.transcribe(full_audio, language="ko", beam_size=5)
+                        text = "".join([segment.text for segment in segments]).strip()
+                        
+                        if text:
+                            print(f"👂 Whisper 결과: {text}")
+                            self.handle_command(text)
+                        
+                        # 버퍼 및 상태 초기화
+                        audio_buffer = []
+                        is_speaking = False
+                        silence_start = None
 
     def handle_command(self, text):
         """음성 인식을 통해 들어온 텍스트를 분석하여 명령 수행"""
@@ -179,7 +310,7 @@ class MVPTestPipeline:
             self.is_muted = False
             self.speak("음성 안내를 다시 시작합니다.")
 
-    def speak(self, text, force_stop=False):
+    def speak(self, text, force_stop=False, is_follow_up=False):
         """안내 문구를 큐에 추가 (비동기)"""
         if force_stop:
             # 기존 큐에 쌓인 모든 메시지 무시하도록 큐 비우기 시도
@@ -189,7 +320,7 @@ class MVPTestPipeline:
                     self.speech_queue.task_done()
                 except:
                     break
-        self.speech_queue.put((text, force_stop))
+        self.speech_queue.put((text, force_stop, is_follow_up))
 
     def stage2_yolo_optimized(self, frame):
         results = self.yolo_model(frame, imgsz=320, verbose=False) 
@@ -231,7 +362,7 @@ class MVPTestPipeline:
         return meters
 
     def run(self):
-        cap = cv2.VideoCapture(0)
+        cap = cv2.VideoCapture(1) # 0은 내장카메라, 1은 외장카메라
         if not cap.isOpened():
             print("카메라를 열 수 없습니다.")
             return
@@ -301,12 +432,18 @@ class MVPTestPipeline:
             cv2.line(display_frame, (roi_left, 0), (roi_left, h), (0, 0, 255), 2)
             cv2.line(display_frame, (roi_right, 0), (roi_right, h), (0, 0, 255), 2)
 
-            current_labels = set()
+            current_entities = set() # (label, dist_bin, pos_bin)
             if closest_obj and min_meters < 10.0:
                 b = closest_obj['box']
                 label_name = closest_obj['label']
                 meters = closest_obj['meters']
-                current_labels.add(label_name)
+                
+                # Generate Spatial Composite Key
+                dist_bin = int(meters / self.DIST_BIN_SIZE)
+                pos_bin = int((closest_obj['cx'] / w) / self.POS_BIN_SIZE)
+                entity_key = (label_name, dist_bin, pos_bin)
+                
+                current_entities.add(entity_key)
 
                 # 시각화 (선택된 물체만 강조)
                 cv2.rectangle(display_frame, (b[0], b[1]), (b[2], b[3]), (0, 0, 255), 3)
@@ -314,18 +451,32 @@ class MVPTestPipeline:
                             cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
 
                 # --- 음성 안내 로직 ---
-                if label_name not in self.announced_objects:
-                    self.speak(f"전방에 {label_name}가 있습니다. 거리는 {meters:.1f} 미터입니다.")
-                    self.announced_objects[label_name] = current_time
+                if entity_key not in self.announced_objects:
+                    # Mark as announced immediately to prevent duplicate triggers
+                    self.announced_objects[entity_key] = current_time
+                    
+                    # Determine position description
+                    pos_desc = "정면"
+                    if closest_obj['cx'] < roi_left + (roi_right - roi_left) * 0.3:
+                        pos_desc = "약간 왼쪽"
+                    elif closest_obj['cx'] > roi_left + (roi_right - roi_left) * 0.7:
+                        pos_desc = "약간 오른쪽"
+                    
+                    # Trigger natural warning (LLM-based) with strict gating
+                    self.follow_up_mgr.schedule_follow_up(label_name, meters, pos_desc, entity_key)
 
                 if should_log:
-                    print(f"[보행 보조] 장애물 감지: {label_name} | 거리: {meters:.1f}m")
+                    print(f"[보행 보조] 장애물 감지: {label_name} | 개체 키: {entity_key} | 거리: {meters:.1f}m")
 
             # 안내 상태 업데이트 (오랫동안 안 보인 사물은 목록에서 제거)
-            for label in list(self.announced_objects.keys()):
-                if label not in current_labels:
-                    if current_time - self.announced_objects[label] > self.announce_timeout:
-                        del self.announced_objects[label]
+            for entity_key in list(self.announced_objects.keys()):
+                if entity_key not in current_entities:
+                    label_name = entity_key[0] # tuple (label, dist, pos)
+                    # 감지 영역에서 사라짐 -> 안내 목록에서 삭제
+                    if current_time - self.announced_objects[entity_key] > self.announce_timeout:
+                        del self.announced_objects[entity_key]
+                        # 만약 사라진 물체에 대한 후속 안내가 예약되어 있다면 취소
+                        self.follow_up_mgr.cancel_pending()
 
             if should_log:
                 last_log_time = current_time
